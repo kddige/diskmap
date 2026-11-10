@@ -98,6 +98,24 @@ Pull requests:
 - Do not merge the pull request titled `chore(main): release X.Y.Z` unless
   asked to cut a release.
 
+## What GitHub enforces
+
+- **`main` takes changes only through pull requests.** Direct pushes, force
+  pushes and deleting the branch are rejected, for the owner too. A pull
+  request needs the `Build and test` and `Conventional commit title` checks
+  to pass and its review conversations resolved, and is squash-merged.
+- **Release tags (`v*`) cannot be moved or deleted.** A bad release is fixed
+  by releasing the next version, not by retagging.
+- **Workflow actions are pinned to a commit**, with the version in a comment
+  (`uses: actions/checkout@<sha> # v4.4.0`). Only actions published by GitHub
+  and `googleapis/release-please-action` are allowed to run; Dependabot
+  proposes updates once a week. Do not add another action without asking.
+- The owner can merge a pull request whose checks have not passed
+  (`gh pr merge --squash --admin`, or the bypass box on the page). This exists
+  for the release pull request: it is opened by a bot, so its checks wait for
+  someone to press "Approve and run". Do not use it for anything else.
+- Report security problems as described in `SECURITY.md`, not in an issue.
+
 ## Releases
 
 Releases are cut by [release-please](https://github.com/googleapis/release-please)
