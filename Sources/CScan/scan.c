@@ -19,6 +19,7 @@
 #include <pthread/qos.h>
 #include <stdio.h>
 #include <sys/attr.h>
+#include <sys/fsgetpath.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
@@ -34,6 +35,9 @@
 #define ATTR_BUF_SIZE (256 * 1024)
 #define MAX_NODES ((size_t)1 << 28)        // 268M entries, 8 GB of address space
 #define MAX_NAME_BYTES (((size_t)1 << 32) - 4096)
+// Rescanning a folder looks originals of clones up by name in the full scan.
+// Past this many names compared, it settles for where the original is.
+#define LOOKUP_BUDGET 20000000
 
 // ---------------------------------------------------------------------------
 // File kinds by extension
@@ -162,39 +166,89 @@ static uint64_t hl_hash(uint64_t ino, uint32_t dev) {
     return x;
 }
 
-// Returns true if (dev, ino) was already present.
-static bool hardlink_seen(dm_tree *t, uint32_t dev, uint64_t ino) {
-    bool seen = false;
-    pthread_mutex_lock(&t->hl_mu);
-    if ((t->hl_len + 1) * 10 > t->hl_cap * 7) {
-        size_t ncap = t->hl_cap ? t->hl_cap * 2 : 4096;
-        HardLink *ntab = calloc(ncap, sizeof(HardLink));
-        for (size_t i = 0; i < t->hl_cap; i++) {
-            if (!t->hl[i].used) continue;
-            size_t j = hl_hash(t->hl[i].ino, t->hl[i].dev) & (ncap - 1);
+static const Owner *owner_find(const OwnerMap *m, uint32_t dev, uint64_t id) {
+    if (!m->cap) return NULL;
+    size_t i = hl_hash(id, dev) & (m->cap - 1);
+    while (m->slots[i].used) {
+        if (m->slots[i].id == id && m->slots[i].dev == dev) return &m->slots[i];
+        i = (i + 1) & (m->cap - 1);
+    }
+    return NULL;
+}
+
+// The entry for (dev, id), added if it was not there yet.
+static Owner *owner_get(OwnerMap *m, uint32_t dev, uint64_t id, bool *added) {
+    if ((m->len + 1) * 10 > m->cap * 7) {
+        size_t ncap = m->cap ? m->cap * 2 : 4096;
+        Owner *ntab = calloc(ncap, sizeof(Owner));
+        for (size_t i = 0; i < m->cap; i++) {
+            if (!m->slots[i].used) continue;
+            size_t j = hl_hash(m->slots[i].id, m->slots[i].dev) & (ncap - 1);
             while (ntab[j].used) j = (j + 1) & (ncap - 1);
-            ntab[j] = t->hl[i];
+            ntab[j] = m->slots[i];
         }
-        free(t->hl);
-        t->hl = ntab;
-        t->hl_cap = ncap;
+        free(m->slots);
+        m->slots = ntab;
+        m->cap = ncap;
     }
-    size_t i = hl_hash(ino, dev) & (t->hl_cap - 1);
-    while (t->hl[i].used) {
-        if (t->hl[i].ino == ino && t->hl[i].dev == dev) {
-            seen = true;
-            break;
+    size_t i = hl_hash(id, dev) & (m->cap - 1);
+    while (m->slots[i].used) {
+        if (m->slots[i].id == id && m->slots[i].dev == dev) {
+            *added = false;
+            return &m->slots[i];
         }
-        i = (i + 1) & (t->hl_cap - 1);
+        i = (i + 1) & (m->cap - 1);
     }
-    if (!seen) {
-        t->hl[i].ino = ino;
-        t->hl[i].dev = dev;
-        t->hl[i].used = 1;
-        t->hl_len++;
+    m->slots[i] = (Owner){.id = id, .dev = dev, .used = 1, .node = DM_NONE};
+    m->len++;
+    *added = true;
+    return &m->slots[i];
+}
+
+// During a rescan of one folder: is `owner`, a node of the full scan, still
+// there and outside the folder being rescanned?
+static bool counted_outside(const dm_tree *base, uint32_t owner, uint32_t folder) {
+    if (owner == DM_NONE) return false;
+    for (uint32_t n = owner; n != DM_NONE; n = base->nodes[n].parent) {
+        if (n == folder) return false;
+        if (atomic_load_explicit(&base->nodes[n].flags, memory_order_relaxed) & DM_F_REMOVED)
+            return false;
+    }
+    return true;
+}
+
+// Returns true if (dev, ino) is already counted on another link. Otherwise
+// this link, entry `index` of directory `dir`, becomes the one that counts.
+static bool hardlink_seen(dm_tree *t, uint32_t dev, uint64_t ino, uint32_t dir, uint32_t index) {
+    bool added;
+    pthread_mutex_lock(&t->hl_mu);
+    Owner *o = owner_get(&t->links, dev, ino, &added);
+    if (added) {
+        o->node = dir;
+        o->index = index;
+        if (t->base) {
+            const Owner *b = owner_find(&t->base->links, dev, ino);
+            if (b && counted_outside(t->base, b->node, t->base_node)) {
+                o->node = DM_NONE;
+                added = false;
+            }
+        }
     }
     pthread_mutex_unlock(&t->hl_mu);
-    return seen;
+    return !added;
+}
+
+// Once the tree is complete, turn (directory, position) into node ids.
+static void resolve_links(dm_tree *t) {
+    for (size_t i = 0; i < t->links.cap; i++) {
+        Owner *o = &t->links.slots[i];
+        if (!o->used || o->node == DM_NONE) continue;
+        const Node *dir = &t->nodes[o->node];
+        // The directory may not have fitted in the tree.
+        bool there = o->index < atomic_load_explicit(&dir->child_count, memory_order_relaxed);
+        o->node = there ? dir->first_child + o->index : DM_NONE;
+        o->index = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +356,7 @@ static void scan_dir(dm_tree *t, Scratch *sc, const Task *task) {
 
     sc->nodes_len = sc->names_len = sc->subdirs_len = sc->clones_len = 0;
     uint64_t bytes = 0;
-    uint32_t files = 0;
+    uint32_t files = 0, folders = 0;
     bool denied = false;
     uint32_t received = 0;
 
@@ -409,6 +463,7 @@ static void scan_dir(dm_tree *t, Scratch *sc, const Task *task) {
             uint8_t flags = 0;
             if (type == VDIR) {
                 flags = DM_F_DIR;
+                folders++;
                 if (mount_status & DIR_MNTSTATUS_MNTPOINT) flags |= DM_F_MOUNT;
                 else if (bsd_flags & SF_DATALESS) flags |= DM_F_DATALESS;
                 else if (!t->fast_apfs || entry_count != 0) { // empty: nothing to open
@@ -422,7 +477,8 @@ static void scan_dir(dm_tree *t, Scratch *sc, const Task *task) {
                 }
             } else {
                 if (type == VLNK) flags |= DM_F_SYMLINK;
-                if (links > 1 && type == VREG && hardlink_seen(t, dev, file_id)) {
+                if (links > 1 && type == VREG &&
+                    hardlink_seen(t, dev, file_id, task->node, (uint32_t)sc->nodes_len)) {
                     flags |= DM_F_HARDLINK;
                     alloc = 0;
                     atomic_fetch_add(&t->hl_dupes, 1);
@@ -460,7 +516,6 @@ static void scan_dir(dm_tree *t, Scratch *sc, const Task *task) {
     }
     close(fd);
     if (denied && sc->nodes_len == 0) mark_denied(t, task->node);
-    atomic_fetch_add_explicit(&t->dirs, 1, memory_order_relaxed);
 
     // Build the tasks for the subdirectories outside the lock.
     size_t nsub = sc->subdirs_len;
@@ -534,6 +589,7 @@ static void scan_dir(dm_tree *t, Scratch *sc, const Task *task) {
         return;
     }
 
+    if (folders) atomic_fetch_add_explicit(&t->dirs, folders, memory_order_relaxed);
     // Roll the sizes up to the root so every directory's total is always live.
     if (files) {
         for (uint32_t n = task->node; n != DM_NONE; n = t->nodes[n].parent) {
@@ -655,9 +711,70 @@ static uint64_t private_size(const dm_tree *t, uint32_t node) {
     return buf.size;
 }
 
+// "/System/Volumes/Data/Users/a" and "/Users/a" are the same folder; so are
+// "/System/Volumes/Data" and "/". Returns the common form: "/Users/a" and "".
+static const char *volume_relative(const char *path) {
+    static const char data[] = "/System/Volumes/Data";
+    size_t n = sizeof data - 1;
+    if (strncmp(path, data, n) == 0 && (path[n] == '/' || path[n] == 0)) path += n;
+    if (path[0] == '/' && path[1] == 0) path++;
+    return path;
+}
+
+// The part of `path` after `dir` (starting with '/') if it lies beneath it.
+static const char *beneath(const char *path, const char *dir) {
+    size_t n = strlen(dir);
+    return strncmp(path, dir, n) == 0 && path[n] == '/' ? path + n : NULL;
+}
+
+// During a rescan of one folder: is the file a clone was made from part of
+// the full scan, outside this folder? Then its data is counted there.
+static bool original_in_base(dm_tree *t, uint32_t dev, uint64_t file_id) {
+    const dm_tree *base = t->base;
+    if (dev != t->root_dev) return false;
+    char path[PATH_MAX];
+    ssize_t len = fsgetpath(path, sizeof path, &t->root_fsid, file_id);
+    if (len <= 0 || (size_t)len >= sizeof path) return false; // deleted since
+    path[len] = 0;
+    const char *p = volume_relative(path);
+    // In this folder, yet this scan did not come across it: do not rely on it.
+    if (beneath(p, volume_relative(t->root_path))) return false;
+    const char *rest = beneath(p, volume_relative(base->root_path));
+    if (!rest) return false;
+
+    const uint32_t *order = atomic_load_explicit(&base->order, memory_order_acquire);
+    uint32_t node = 0;
+    while (*rest == '/') {
+        const char *name = rest + 1;
+        size_t name_len = strcspn(name, "/");
+        const Node *dir = &base->nodes[node];
+        uint32_t cc = atomic_load_explicit(&dir->child_count, memory_order_relaxed);
+        if ((t->lookup_budget -= cc) < 0) return true;
+        uint32_t found = DM_NONE;
+        for (uint32_t i = 0; i < cc && found == DM_NONE; i++) {
+            uint32_t c = order[dir->first_child + i];
+            const Node *nd = &base->nodes[c];
+            if (nd->name_len == name_len && memcmp(base->names + nd->name_off, name, name_len) == 0)
+                found = c;
+        }
+        if (found == DM_NONE) return false; // not there when the full scan ran
+        node = found;
+        rest = name + name_len;
+    }
+    return node != 0;
+}
+
+static bool counted_in_base(dm_tree *t, uint32_t dev, uint64_t clone_id) {
+    const Owner *o = owner_find(&t->base->families, dev, clone_id);
+    if (o && counted_outside(t->base, o->node, t->base_node)) return true;
+    return original_in_base(t, dev, clone_id);
+}
+
 // Clones of one file share their blocks, so adding each one up in full counts
 // the same data many times over. Each family is counted once: on the file it
-// was cloned from if that was scanned, otherwise on its oldest clone.
+// was cloned from if that was scanned, otherwise on its oldest clone. When
+// rescanning one folder, a family already counted in the rest of the full
+// scan is not counted here at all.
 static void resolve_clones(dm_tree *t) {
     size_t count = t->clones_len;
     Clone *clones = t->clones;
@@ -704,8 +821,12 @@ static void resolve_clones(dm_tree *t) {
             while (keys[j] != key) j = (j + 1) & (cap - 1);
             family_has_owner = atomic_load_explicit(&present[j], memory_order_relaxed);
             if (!family_has_owner) {
-                family_has_owner = true; // this one keeps its full size
-                continue;
+                family_has_owner = true;
+                if (!t->base || !counted_in_base(t, c->dev, c->clone_id)) {
+                    bool added;
+                    owner_get(&t->families, c->dev, c->clone_id, &added)->node = c->node;
+                    continue; // this one keeps its full size
+                }
             }
         }
         Node *nd = &t->nodes[c->node];
@@ -719,6 +840,7 @@ static void resolve_clones(dm_tree *t) {
         }
         uint64_t shared = size - own;
         atomic_fetch_or_explicit(&nd->flags, DM_F_CLONE, memory_order_relaxed);
+        nd->cut = shared / 512 > UINT32_MAX ? UINT32_MAX : (uint32_t)(shared / 512);
         for (uint32_t n = c->node; n != DM_NONE; n = t->nodes[n].parent)
             atomic_fetch_sub_explicit(&t->nodes[n].size, shared, memory_order_relaxed);
         files++;
@@ -734,7 +856,7 @@ static void resolve_clones(dm_tree *t) {
 static void finalize(dm_tree *t) {
     resolve_clones(t);
     uint32_t n = atomic_load(&t->count);
-    uint32_t *order = malloc((size_t)n * sizeof(uint32_t));
+    uint32_t *order = t->order_map;
     for (uint32_t i = 0; i < n; i++) order[i] = i;
 
     const size_t chunk = 16384;
@@ -759,6 +881,37 @@ static void finalize(dm_tree *t) {
     atomic_store(&t->order, order);
 }
 
+// What the scan-wide counters hold for `node` and everything beneath it.
+typedef struct {
+    uint64_t dirs, dupes, clone_files, clone_bytes;
+} Counts;
+
+static void subtree_counts(const dm_tree *t, uint32_t node, Counts *out) {
+    const uint32_t *order = atomic_load_explicit(&t->order, memory_order_acquire);
+    size_t cap = 4096, len = 0;
+    uint32_t *stack = malloc(cap * sizeof(uint32_t));
+    stack[len++] = node;
+    while (len) {
+        const Node *n = &t->nodes[stack[--len]];
+        uint8_t flags = atomic_load_explicit(&n->flags, memory_order_relaxed);
+        if (flags & DM_F_REMOVED) continue;
+        if (flags & DM_F_HARDLINK) out->dupes++;
+        if (flags & DM_F_CLONE) {
+            out->clone_files++;
+            out->clone_bytes += (uint64_t)n->cut * 512;
+        }
+        if (!(flags & DM_F_DIR)) continue;
+        out->dirs++;
+        uint32_t cc = atomic_load_explicit(&n->child_count, memory_order_relaxed);
+        if (len + cc > cap) {
+            cap = (len + cc) * 2;
+            stack = realloc(stack, cap * sizeof(uint32_t));
+        }
+        for (uint32_t i = 0; i < cc; i++) stack[len++] = order[n->first_child + i];
+    }
+    free(stack);
+}
+
 static void *finisher_main(void *arg) {
     dm_tree *t = arg;
     for (int i = 0; i < t->nthreads; i++) pthread_join(t->threads[i], NULL);
@@ -767,10 +920,16 @@ static void *finisher_main(void *arg) {
     t->qlen = 0;
     atomic_store(&t->state, DM_STATE_FINALIZING);
     finalize(t);
+    resolve_links(t);
+    if (t->base) {
+        Counts old = {0};
+        subtree_counts(t->base, t->base_node, &old);
+        t->old_dirs = old.dirs - 1; // the folder itself stays
+        t->old_dupes = old.dupes;
+        t->old_clone_files = old.clone_files;
+        t->old_clone_bytes = old.clone_bytes;
+    }
     atomic_store(&t->t_end, mach_absolute_time());
-    free(t->hl);
-    t->hl = NULL;
-    t->hl_cap = t->hl_len = 0;
     atomic_store(&t->state, DM_STATE_DONE);
     return NULL;
 }
@@ -788,31 +947,43 @@ static void *reserve(size_t *bytes) {
     }
 }
 
-dm_tree *dm_scan_start(const char *root_path, int threads) {
+// Starts a scan of `resolved`, a directory. With `base`, it is a rescan of
+// the folder at `base_node` of that tree.
+static dm_tree *scan_begin(const char *resolved, const struct stat *root_st, int threads,
+                           dm_tree *base, uint32_t base_node) {
     pthread_once(&g_ext_once, ext_init);
-
-    char resolved[PATH_MAX];
-    if (!realpath(root_path, resolved)) return NULL;
-    struct stat st;
-    if (stat(resolved, &st) != 0 || !S_ISDIR(st.st_mode)) return NULL;
+    struct stat st = *root_st;
 
     dm_tree *t = calloc(1, sizeof *t);
     size_t node_bytes = MAX_NODES * sizeof(Node);
     t->nodes = reserve(&node_bytes);
     size_t name_bytes = MAX_NAME_BYTES;
     t->names = reserve(&name_bytes);
-    if (!t->nodes || !t->names) {
+    size_t order_bytes = t->nodes ? node_bytes / sizeof(Node) * sizeof(uint32_t) : 0;
+    t->order_map = order_bytes ? reserve(&order_bytes) : NULL;
+    if (!t->nodes || !t->names || !t->order_map) {
+        if (t->nodes) munmap(t->nodes, node_bytes);
+        if (t->names) munmap(t->names, name_bytes);
+        if (t->order_map) munmap(t->order_map, order_bytes);
         free(t);
         return NULL;
     }
     t->nodes_bytes = node_bytes;
     t->names_bytes = name_bytes;
+    t->order_bytes = order_bytes;
     t->cap = node_bytes / sizeof(Node);
+    if (t->cap > order_bytes / sizeof(uint32_t)) t->cap = order_bytes / sizeof(uint32_t);
     t->names_cap = name_bytes;
     t->root_path = strdup(resolved);
+    t->root_dev = (uint32_t)st.st_dev;
+    t->base = base;
+    t->base_node = base_node;
+    t->base_version = base ? base->version : 0;
+    t->lookup_budget = LOOKUP_BUDGET;
     pthread_mutex_init(&t->mu, NULL);
     pthread_mutex_init(&t->hl_mu, NULL);
     pthread_cond_init(&t->cv, NULL);
+    pthread_rwlock_init(&t->rw, NULL);
 
     // Node 0: the root. Its name is the full path.
     size_t root_len = strlen(resolved);
@@ -824,6 +995,7 @@ dm_tree *dm_scan_start(const char *root_path, int threads) {
     memcpy(t->names, resolved, root_len + 1);
     t->names_len = root_len + 1;
     atomic_store(&t->count, 1);
+    atomic_store(&t->dirs, 1);
 
     t->qcap = 1024;
     t->queue = malloc(t->qcap * sizeof(Task));
@@ -831,7 +1003,9 @@ dm_tree *dm_scan_start(const char *root_path, int threads) {
 
     struct statfs sfs;
     struct stat sys;
-    t->fast_apfs = statfs(resolved, &sfs) == 0 && strcmp(sfs.f_fstypename, "apfs") == 0 &&
+    bool mounted = statfs(resolved, &sfs) == 0;
+    if (mounted) t->root_fsid = sfs.f_fsid;
+    t->fast_apfs = mounted && strcmp(sfs.f_fstypename, "apfs") == 0 &&
                    stat("/", &sys) == 0 && sys.st_dev != st.st_dev;
     t->qlen = 1;
 
@@ -851,6 +1025,29 @@ dm_tree *dm_scan_start(const char *root_path, int threads) {
     for (int i = 0; i < threads; i++) pthread_create(&t->threads[i], NULL, worker_main, t);
     pthread_create(&t->finisher, NULL, finisher_main, t);
     return t;
+}
+
+dm_tree *dm_scan_start(const char *root_path, int threads) {
+    char resolved[PATH_MAX];
+    if (!realpath(root_path, resolved)) return NULL;
+    struct stat st;
+    if (stat(resolved, &st) != 0 || !S_ISDIR(st.st_mode)) return NULL;
+    return scan_begin(resolved, &st, threads, NULL, 0);
+}
+
+dm_tree *dm_rescan_start(dm_tree *t, uint32_t node, int threads) {
+    if (!t || atomic_load(&t->state) != DM_STATE_DONE) return NULL;
+    if (node == 0 || !dm_node_alive(t, node)) return NULL;
+    uint8_t flags = atomic_load(&t->nodes[node].flags);
+    if (!(flags & DM_F_DIR) || (flags & (DM_F_MOUNT | DM_F_DATALESS))) return NULL;
+    char path[PATH_MAX];
+    size_t len = dm_node_path(t, node, path, sizeof path);
+    if (len == 0 || len >= sizeof path) return NULL;
+    struct stat st;
+    // Still a folder, and not one another volume was mounted on since (the
+    // root of a volume has inode 2): that volume is not part of this scan.
+    if (lstat(path, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_ino == 2) return NULL;
+    return scan_begin(path, &st, threads, t, node);
 }
 
 void dm_scan_cancel(dm_tree *t) {
@@ -873,7 +1070,9 @@ void dm_tree_free(dm_tree *t) {
     dm_scan_wait(t);
     munmap(t->nodes, t->nodes_bytes);
     munmap(t->names, t->names_bytes);
-    free(atomic_load(&t->order));
+    munmap(t->order_map, t->order_bytes);
+    free(t->links.slots);
+    free(t->families.slots);
     free(t->queue);
     free(t->threads);
     free(t->denied);
@@ -882,6 +1081,7 @@ void dm_tree_free(dm_tree *t) {
     pthread_mutex_destroy(&t->mu);
     pthread_mutex_destroy(&t->hl_mu);
     pthread_cond_destroy(&t->cv);
+    pthread_rwlock_destroy(&t->rw);
     free(t);
 }
 
@@ -947,6 +1147,28 @@ bool dm_is_within(const dm_tree *t, uint32_t node, uint32_t ancestor) {
     return false;
 }
 
+bool dm_node_alive(const dm_tree *t, uint32_t node) {
+    if (node >= atomic_load(&t->count)) return false;
+    for (uint32_t n = node; n != DM_NONE; n = t->nodes[n].parent)
+        if (atomic_load_explicit(&t->nodes[n].flags, memory_order_relaxed) & DM_F_REMOVED)
+            return false;
+    return true;
+}
+
+static void counter_adjust(_Atomic uint64_t *counter, uint64_t add, uint64_t sub) {
+    uint64_t v = atomic_load(counter) + add;
+    atomic_store(counter, v > sub ? v - sub : 0);
+}
+
+// Drops the unreadable folders that are gone, and `also` (DM_NONE for none).
+static void prune_denied(dm_tree *t, uint32_t also) {
+    size_t kept = 0;
+    for (size_t i = 0; i < t->denied_len; i++)
+        if (t->denied[i] != also && dm_node_alive(t, t->denied[i])) t->denied[kept++] = t->denied[i];
+    t->denied_len = kept;
+    atomic_store(&t->denied_count, kept);
+}
+
 void dm_remove_node(dm_tree *t, uint32_t node) {
     uint32_t *order = atomic_load(&t->order);
     if (!order || node == 0) return;
@@ -955,7 +1177,10 @@ void dm_remove_node(dm_tree *t, uint32_t node) {
     if (flags & DM_F_REMOVED) return;
     uint64_t size = atomic_load(&nd->size);
     uint32_t files = (flags & DM_F_DIR) ? atomic_load(&nd->file_count) : 1;
+    Counts gone = {0};
+    subtree_counts(t, node, &gone);
 
+    pthread_rwlock_wrlock(&t->rw);
     atomic_fetch_or(&nd->flags, DM_F_REMOVED);
     atomic_store(&nd->size, 0);
     for (uint32_t n = nd->parent; n != DM_NONE; n = t->nodes[n].parent) {
@@ -974,6 +1199,109 @@ void dm_remove_node(dm_tree *t, uint32_t node) {
             first = false;
         }
     }
+    counter_adjust(&t->dirs, 0, gone.dirs);
+    counter_adjust(&t->hl_dupes, 0, gone.dupes);
+    counter_adjust(&t->clone_files, 0, gone.clone_files);
+    counter_adjust(&t->clone_bytes, 0, gone.clone_bytes);
+    prune_denied(t, DM_NONE);
+    t->version++;
+    pthread_rwlock_unlock(&t->rw);
+}
+
+bool dm_rescan_apply(dm_tree *t, dm_tree *r) {
+    if (!t || !r || r->base != t || r->applied) return false;
+    if (atomic_load(&r->state) != DM_STATE_DONE || atomic_load(&r->cancel)) return false;
+    uint32_t node = r->base_node;
+    if (r->base_version != t->version || !dm_node_alive(t, node)) return false;
+    uint32_t n = atomic_load(&r->count), base = atomic_load(&t->count);
+    if ((size_t)base + n - 1 > t->cap || t->names_len + r->names_len > t->names_cap) return false;
+    uint32_t *order = atomic_load(&t->order);
+    const uint32_t *new_order = atomic_load(&r->order);
+    // The rescan's node 0 is the folder itself; its node i becomes i + shift.
+    // The copy keeps both properties the tree relies on: the children of a
+    // directory are contiguous and come after it.
+    uint32_t shift = base - 1;
+
+    pthread_rwlock_wrlock(&t->rw);
+    Node *folder = &t->nodes[node];
+    const Node *root = &r->nodes[0];
+
+    // What the folder held is left where it is (the tree only grows) and
+    // marked as gone, so anyone still holding one of those ids can tell.
+    uint32_t old_children = atomic_load(&folder->child_count);
+    for (uint32_t i = 0; i < old_children; i++)
+        atomic_fetch_or(&t->nodes[order[folder->first_child + i]].flags, DM_F_REMOVED);
+
+    uint32_t names_base = (uint32_t)t->names_len;
+    memcpy(t->names + t->names_len, r->names, r->names_len);
+    t->names_len += r->names_len;
+    for (uint32_t i = 1; i < n; i++) {
+        Node *nd = &t->nodes[i + shift];
+        memcpy(nd, &r->nodes[i], sizeof *nd);
+        nd->parent = nd->parent == 0 ? node : nd->parent + shift;
+        nd->name_off += names_base;
+        if ((atomic_load_explicit(&nd->flags, memory_order_relaxed) & DM_F_DIR) &&
+            atomic_load_explicit(&nd->child_count, memory_order_relaxed) > 0)
+            nd->first_child += shift;
+        order[i + shift] = new_order[i] + shift;
+    }
+    atomic_store_explicit(&t->count, base + n - 1, memory_order_release);
+
+    uint32_t children = atomic_load(&root->child_count);
+    atomic_store(&folder->child_count, 0);
+    folder->first_child = children ? root->first_child + shift : 0;
+    atomic_store(&folder->child_count, children);
+    folder->kind = root->kind;
+    if (atomic_load(&root->flags) & DM_F_UNREADABLE) atomic_fetch_or(&folder->flags, DM_F_UNREADABLE);
+    else atomic_fetch_and(&folder->flags, (uint8_t)~DM_F_UNREADABLE);
+
+    // New totals for the folder and everything above it; unsigned wrap-around
+    // makes the same addition work when the folder shrank.
+    uint64_t size_delta = atomic_load(&root->size) - atomic_load(&folder->size);
+    uint32_t files_delta = atomic_load(&root->file_count) - atomic_load(&folder->file_count);
+    for (uint32_t a = node; a != DM_NONE; a = t->nodes[a].parent) {
+        atomic_fetch_add(&t->nodes[a].size, size_delta);
+        atomic_fetch_add(&t->nodes[a].file_count, files_delta);
+    }
+    for (uint32_t a = node; t->nodes[a].parent != DM_NONE; a = t->nodes[a].parent) {
+        Node *p = &t->nodes[t->nodes[a].parent];
+        uint32_t cc = atomic_load(&p->child_count);
+        dm_sort_children(t, order + p->first_child, cc);
+        p->kind = cc ? t->nodes[order[p->first_child]].kind : DM_KIND_OTHER;
+    }
+
+    counter_adjust(&t->dirs, atomic_load(&r->dirs) - 1, r->old_dirs);
+    counter_adjust(&t->hl_dupes, atomic_load(&r->hl_dupes), r->old_dupes);
+    counter_adjust(&t->clone_files, atomic_load(&r->clone_files), r->old_clone_files);
+    counter_adjust(&t->clone_bytes, atomic_load(&r->clone_bytes), r->old_clone_bytes);
+    atomic_fetch_add(&t->errors, atomic_load(&r->errors));
+
+    prune_denied(t, node);
+    if (t->denied_len + r->denied_len > t->denied_cap) {
+        t->denied_cap = (t->denied_len + r->denied_len) * 2;
+        t->denied = realloc(t->denied, t->denied_cap * sizeof(uint32_t));
+    }
+    for (size_t i = 0; i < r->denied_len; i++)
+        t->denied[t->denied_len++] = r->denied[i] == 0 ? node : r->denied[i] + shift;
+    atomic_store(&t->denied_count, t->denied_len);
+
+    // From now on the links and clone families found in the folder are
+    // counted on their new nodes. Entries for what the folder used to hold
+    // point at nodes that are gone, which reads as "counted nowhere".
+    const OwnerMap *from[2] = {&r->links, &r->families};
+    OwnerMap *into[2] = {&t->links, &t->families};
+    for (int m = 0; m < 2; m++) {
+        for (size_t i = 0; i < from[m]->cap; i++) {
+            const Owner *o = &from[m]->slots[i];
+            if (!o->used || o->node == DM_NONE) continue;
+            bool added;
+            owner_get(into[m], o->dev, o->id, &added)->node = o->node + shift;
+        }
+    }
+    t->version++;
+    r->applied = true;
+    pthread_rwlock_unlock(&t->rw);
+    return true;
 }
 
 uint32_t dm_denied_count(const dm_tree *t) { return (uint32_t)atomic_load(&t->denied_count); }
@@ -988,6 +1316,7 @@ void dm_subtree_stats(const dm_tree *t, uint32_t node, uint64_t kind_bytes[DM_KI
     if (top_count) *top_count = 0;
     const uint32_t *order = atomic_load(&t->order);
     if (!order) return;
+    pthread_rwlock_rdlock((pthread_rwlock_t *)&t->rw);
 
     // Min-heap of the largest files seen so far, keyed by size.
     uint64_t *heap_size = top_cap ? malloc(top_cap * sizeof(uint64_t)) : NULL;
@@ -1044,6 +1373,7 @@ void dm_subtree_stats(const dm_tree *t, uint32_t node, uint64_t kind_bytes[DM_KI
         }
     }
     free(stack);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&t->rw);
 
     // Heap -> descending order (simple selection; top_cap is small).
     for (uint32_t i = 0; i < heap_len; i++) {

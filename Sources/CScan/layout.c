@@ -217,13 +217,16 @@ dm_layout *dm_layout_create(const dm_tree *t, uint32_t root, int width, int heig
                             const dm_layout_params *p) {
     dm_layout *l = calloc(1, sizeof *l);
     l->tree = t;
-    l->order = atomic_load_explicit(&t->order, memory_order_acquire);
     l->p = *p;
     l->width = width;
     l->height = height;
     float s[4] = {0, 0, 0, 0};
+    // Keeps a removal or a folder rescan from changing the tree halfway.
+    pthread_rwlock_rdlock((pthread_rwlock_t *)&t->rw);
+    l->order = atomic_load_explicit(&t->order, memory_order_acquire);
     if (width > 0 && height > 0 && root < atomic_load(&t->count))
         layout_dir(l, root, 0, 0, 0, (float)width, (float)height, s, p->cushion_height, 0);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&t->rw);
     free(l->tmp);
     l->tmp = NULL;
     return l;

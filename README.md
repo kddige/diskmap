@@ -52,6 +52,7 @@ updating DiskMap, remove it from that list and add it again.
 | ⌘↑, ⇧⌘↑ | zoom out, zoom to the top |
 | ⇧⌘D, ⇧⌘H, ⌘O | scan Macintosh HD, the home folder, a chosen folder |
 | ⌘R | rescan (stop while scanning) |
+| ⌥⌘R | rescan only the selected folder, after cleaning up in it |
 | ⌘I | disk summary: what the scan found against what macOS says is used |
 | ⇧⌘R | reveal in Finder |
 | ⌘⌫ | move to Trash (asks first) |

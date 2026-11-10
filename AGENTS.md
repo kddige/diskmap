@@ -30,6 +30,7 @@ Check a UI change by looking at it, not only by compiling it:
     .build/release/DiskMap /Applications --snapshot /tmp/window.png   # scan, save a picture of the window, quit
     .build/release/DiskMap --snapshot /tmp/welcome.png                # the welcome screen
     DISKMAP_SNAPSHOT_SUMMARY=1 .build/release/DiskMap /Applications --snapshot /tmp/summary.png
+    DISKMAP_SNAPSHOT_RESCAN=/Applications/Utilities .build/release/DiskMap /Applications --snapshot /tmp/rescan.png   # rescan that folder first
     .build/release/DiskMap ~ --render /tmp/map.png --size 1400x900    # the map alone, no window
 
 `scripts/make-screenshot.sh` regenerates `docs/screenshot.png` from made-up

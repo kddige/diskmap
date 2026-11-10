@@ -54,7 +54,7 @@ typedef struct {
 
 typedef struct {
     uint64_t files;
-    uint64_t dirs;
+    uint64_t dirs;          // folders found, the root included
     uint64_t bytes;
     uint64_t denied;        // directories we could not open (permissions)
     uint64_t errors;        // other failures
@@ -91,6 +91,35 @@ bool dm_is_within(const dm_tree *t, uint32_t node, uint32_t ancestor);
 // After the scan: forget a node (it was deleted on disk). Subtracts its size
 // from every ancestor and re-sorts the affected sibling lists.
 void dm_remove_node(dm_tree *t, uint32_t node);
+// False once the node, or a folder above it, was removed or replaced by a
+// rescan. Ids are never reused, so a stale id stays safe to ask about.
+bool dm_node_alive(const dm_tree *t, uint32_t node);
+
+// Rescanning one folder of a finished scan.
+//
+// dm_rescan_start() scans the folder at `node` again, on its own, and returns
+// a tree for that scan: follow it with dm_progress_get(), stop it with
+// dm_scan_cancel(), free it with dm_tree_free(). Hard links and clones whose
+// data is already counted elsewhere in `t` are not counted again. Returns
+// NULL if the folder cannot be rescanned on its own: the root (scan again
+// instead), a folder that is gone, a mount point or a cloud-only folder.
+//
+// A rescan sees only its own folder, so what changed between that folder and
+// the rest since the full scan can be off until the next full scan: a hard
+// link made since then to a file outside the folder is counted a second time,
+// and when the link or clone original that carried the data was deleted from
+// the folder, its twin outside keeps showing only what it does not share.
+//
+// `t` must not change (dm_remove_node, dm_rescan_apply) or be freed until the
+// rescan is done or freed, so run one rescan at a time.
+//
+// dm_rescan_apply() swaps the result into `t` once the rescan is done: the
+// folder gets its new contents, every folder above it its new totals. Nodes
+// that were inside the folder are no longer alive. Returns false, changing
+// nothing, if the rescan was cancelled, is not finished, or `t` changed in
+// the meantime. Call it from the thread that owns `t`.
+dm_tree *dm_rescan_start(dm_tree *t, uint32_t node, int threads);
+bool dm_rescan_apply(dm_tree *t, dm_tree *rescan);
 
 // Directories that could not be read.
 uint32_t dm_denied_count(const dm_tree *t);
