@@ -154,6 +154,37 @@ final class ScanSession {
 
     func isWithin(_ node: UInt32, _ ancestor: UInt32) -> Bool { dm_is_within(tree, node, ancestor) }
 
+    /// False for a node that was moved to the Trash or replaced by a rescan of
+    /// its folder, and for everything that was inside one.
+    func isAlive(_ node: UInt32) -> Bool { node != noNode && dm_node_alive(tree, node) }
+
+    /// The names that lead from `ancestor` down to `node`.
+    func names(from ancestor: UInt32, to node: UInt32) -> [String] {
+        var names: [String] = []
+        var n = node
+        while n != ancestor && n != noNode {
+            let entry = info(n)
+            names.append(String(cString: entry.name))
+            n = entry.parent
+        }
+        return names.reversed()
+    }
+
+    /// Follows `names` down from `node` for as long as they exist.
+    func descendant(of node: UInt32, along names: [String]) -> UInt32 {
+        var current = node
+        for name in names {
+            let count = info(current).child_count
+            let next = name.withCString { wanted in
+                (0..<count).lazy.map { dm_child_at(self.tree, current, $0) }
+                    .first { strcmp(self.info($0).name, wanted) == 0 }
+            }
+            guard let next else { break }
+            current = next
+        }
+        return current
+    }
+
     /// Root-first chain of ancestors ending at `node`.
     func ancestry(_ node: UInt32) -> [UInt32] {
         var chain: [UInt32] = []
@@ -165,10 +196,14 @@ final class ScanSession {
         return chain.reversed()
     }
 
+    /// Takes a node that the user moved to the Trash off the map.
     func remove(_ node: UInt32) {
         trashedBytes += info(node).size
-        dm_remove_node(tree, node)
+        forget(node)
     }
+
+    /// Takes a node that is no longer on disk off the map.
+    func forget(_ node: UInt32) { dm_remove_node(tree, node) }
 
     struct Stats {
         var kindBytes: [UInt64]
@@ -185,6 +220,70 @@ final class ScanSession {
 
     var deniedPaths: [String] {
         (0..<dm_denied_count(tree)).map { path(dm_denied_at(tree, $0)) }
+    }
+}
+
+// MARK: - Rescanning one folder
+
+/// A second scan of one folder of a finished scan. Until it is applied or
+/// thrown away, nothing else may change the session's tree.
+final class FolderRescan {
+    let session: ScanSession
+    let node: UInt32
+    private let tree: OpaquePointer
+
+    /// Nil if the folder cannot be scanned on its own (see dm_rescan_start).
+    init?(session: ScanSession, node: UInt32) {
+        guard let tree = dm_rescan_start(session.tree, node, 0) else { return nil }
+        self.session = session
+        self.node = node
+        self.tree = tree
+    }
+
+    deinit {
+        // The rescan reads the session's tree while it runs, so it has to be
+        // stopped and freed before the session may go. Off the main thread:
+        // freeing waits for the scan threads.
+        let tree = self.tree, session = self.session
+        DispatchQueue.global(qos: .utility).async {
+            dm_tree_free(tree)
+            withExtendedLifetime(session) {}
+        }
+    }
+
+    var progress: dm_progress {
+        var p = dm_progress()
+        dm_progress_get(tree, &p)
+        return p
+    }
+
+    func cancel() { dm_scan_cancel(tree) }
+
+    /// Swaps the result into the session. False if there is nothing to swap in.
+    func apply() -> Bool {
+        let path = session.rawPath(node)
+        guard dm_rescan_apply(session.tree, tree) else { return false }
+        // If the Trash is in the folder, the scan has now found what was
+        // moved there, and the summary must not add it a second time.
+        if contains(trashOf: path) { session.trashedBytes = 0 }
+        return true
+    }
+
+    /// Whether the Trash that files from `path` go to lies in that folder.
+    /// Compared by file identity: /Users and /System/Volumes/Data/Users are
+    /// the same folder under two names.
+    private func contains(trashOf path: String) -> Bool {
+        var folder = stat()
+        guard stat(path, &folder) == 0,
+              var url = try? FileManager.default.url(for: .trashDirectory, in: .userDomainMask,
+                                                     appropriateFor: URL(fileURLWithPath: path), create: false)
+        else { return false }
+        while true {
+            var entry = stat()
+            if stat(url.path, &entry) == 0, entry.st_dev == folder.st_dev, entry.st_ino == folder.st_ino { return true }
+            if url.path == "/" { return false }
+            url.deleteLastPathComponent()
+        }
     }
 }
 

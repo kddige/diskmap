@@ -71,6 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         add(file, "Scan Folder…", #selector(MainWindowController.chooseFolder(_:)), "o")
         file.addItem(.separator())
         add(file, "Rescan", #selector(MainWindowController.rescanOrStop(_:)), "r")
+        add(file, "Rescan Folder", #selector(MainWindowController.rescanFolder(_:)), "r", [.command, .option])
         add(file, "Disk Summary…", #selector(MainWindowController.showSummary(_:)), "i")
         file.addItem(.separator())
         add(file, "Reveal in Finder", #selector(MainWindowController.revealInFinder(_:)), "r", [.command, .shift])

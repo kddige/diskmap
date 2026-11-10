@@ -24,6 +24,10 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSMenuI
     private var hovered: UInt32 = noNode
     private var crumbs: [UInt32] = []
     private var statsGeneration = 0
+    private var folderRescan: FolderRescan?
+    private var rescanTimer: Timer?
+    /// What the last rescan of a single folder changed, for the status bar.
+    private var rescanNote: String?
 
     private let treemap = TreemapView()
     private let pathControl = NSPathControl()
@@ -223,6 +227,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSMenuI
         contextMenu.addItem(withTitle: "Zoom In", action: #selector(zoomIn(_:)), keyEquivalent: "")
         contextMenu.addItem(withTitle: "Reveal in Finder", action: #selector(revealInFinder(_:)), keyEquivalent: "")
         contextMenu.addItem(withTitle: "Copy Path", action: #selector(copyPath(_:)), keyEquivalent: "")
+        contextMenu.addItem(withTitle: "Rescan Folder", action: #selector(rescanFolder(_:)), keyEquivalent: "")
         contextMenu.addItem(.separator())
         contextMenu.addItem(withTitle: "Move to Trash…", action: #selector(moveToTrash(_:)), keyEquivalent: "")
         for item in contextMenu.items { item.target = self }
@@ -263,6 +268,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSMenuI
     func startScan(path: String) {
         timer?.invalidate()
         timer = nil
+        dropFolderRescan()
         session?.cancel()
         guard let session = ScanSession(path: path) else {
             let alert = NSAlert()
@@ -275,6 +281,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSMenuI
         scanPath = path
         selected = noNode
         hovered = noNode
+        rescanNote = nil
         statsGeneration += 1
         showWelcome(false)
         window?.title = session.rootDisplayName
@@ -316,23 +323,34 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSMenuI
         timer?.invalidate()
         timer = nil
         guard let session else { return }
-        let progress = session.progress
         treemap.reload()
         folders.setSession(session)
         sidebarPlaceholder.isHidden = true
         refreshStats()
         updateSummaryLine()
-        if progress.denied > 0 {
-            warning.title = "  \(formatCount(progress.denied)) unreadable folder\(progress.denied == 1 ? "" : "s")  "
-            warning.isHidden = false
-        }
+        updateWarning()
         updateStatus()
         window?.toolbar?.validateVisibleItems()
 
         if let snapshotPath {
             // Give the last render and the lists a moment to land.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self.writeSnapshot(to: snapshotPath) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                // Test hook: rescan this folder first; the picture follows.
+                if let folder = ProcessInfo.processInfo.environment["DISKMAP_SNAPSHOT_RESCAN"] {
+                    let names = folder.dropFirst(session.rootPath.count).split(separator: "/").map(String.init)
+                    self.select(session.descendant(of: 0, along: names), from: .other)
+                    self.rescanFolder(nil)
+                    if self.folderRescan != nil { return }
+                }
+                self.writeSnapshot(to: snapshotPath)
+            }
         }
+    }
+
+    private func updateWarning() {
+        let denied = session?.progress.denied ?? 0
+        warning.title = "  \(formatCount(denied)) unreadable folder\(denied == 1 ? "" : "s")  "
+        warning.isHidden = denied == 0
     }
 
     private func updateSummaryLine() {
@@ -341,7 +359,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSMenuI
         let total = session.info(0).size
         let time = String(format: "%.1f s", locale: Locale.current, progress.elapsed)
         statusRight.stringValue = "\(formatBytes(total)) in \(formatCount(UInt64(session.info(0).file_count))) files  ·  "
-            + (progress.cancelled ? "stopped after \(time)" : "scanned in \(time)")
+            + (rescanNote ?? (progress.cancelled ? "stopped after \(time)" : "scanned in \(time)"))
         window?.subtitle = progress.cancelled ? "\(formatBytes(total)) (incomplete)" : formatBytes(total)
     }
 
@@ -369,7 +387,10 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSMenuI
     private enum Source { case map, folders, largest, other }
 
     private func select(_ node: UInt32, from source: Source) {
-        guard session != nil else { return }
+        guard let session else { return }
+        // The map and the lists can still show something for a moment after
+        // it went away; a click on that selects nothing.
+        let node = session.isAlive(node) ? node : noNode
         selected = node
         treemap.selected = node
         if isReady {
@@ -439,12 +460,14 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSMenuI
     // MARK: TreemapViewDelegate
 
     func treemap(_ view: TreemapView, didHover node: UInt32) {
-        hovered = node
+        hovered = session?.isAlive(node) == true ? node : noNode
         updateStatus()
     }
 
     func treemap(_ view: TreemapView, didSelect node: UInt32) { select(node, from: .map) }
-    func treemap(_ view: TreemapView, wantsZoomTo node: UInt32) { zoom(to: node) }
+    func treemap(_ view: TreemapView, wantsZoomTo node: UInt32) {
+        if session?.isAlive(node) == true { zoom(to: node) }
+    }
     func treemapWantsZoomOut(_ view: TreemapView) { zoomOut(nil) }
     func treemapContextMenu(_ view: TreemapView) -> NSMenu? { contextMenu }
 
@@ -470,10 +493,126 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSMenuI
     }
 
     @objc func rescanOrStop(_ sender: Any?) {
-        if isScanning {
+        if let folderRescan {
+            folderRescan.cancel()
+        } else if isScanning {
             session?.cancel()
         } else if let scanPath {
             startScan(path: scanPath)
+        }
+    }
+
+    // MARK: Rescanning one folder
+
+    /// The folder "Rescan Folder" would scan: the selected folder, the folder
+    /// the selected file is in, or with nothing selected the one on the map.
+    private var rescanTarget: UInt32 {
+        guard let session, isReady else { return noNode }
+        let node = selected != noNode ? selected : treemap.root
+        return session.isDirectory(node) ? node : session.parent(node)
+    }
+
+    @objc func rescanFolder(_ sender: Any?) {
+        guard let session, let window, isReady, folderRescan == nil, window.attachedSheet == nil else { return }
+        let node = rescanTarget
+        guard node != noNode else { return }
+        if node == 0 {
+            // The top folder is the whole scan.
+            rescanOrStop(nil)
+            return
+        }
+        guard let rescan = FolderRescan(session: session, node: node) else {
+            let alert = NSAlert()
+            let name = session.name(node)
+            if FileManager.default.fileExists(atPath: session.rawPath(node)) {
+                alert.messageText = "“\(name)” cannot be rescanned on its own."
+                alert.informativeText = "To bring the whole map up to date, choose File > Rescan."
+            } else {
+                alert.messageText = "“\(name)” is no longer there."
+                alert.informativeText = "It was deleted or moved after the scan, so it has been taken off the map."
+                didRemove(node, trashed: false)
+            }
+            alert.beginSheetModal(for: window)
+            return
+        }
+        folderRescan = rescan
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.folderRescanTick() }
+        RunLoop.main.add(timer, forMode: .common)
+        rescanTimer = timer
+        folderRescanTick()
+        window.toolbar?.validateVisibleItems()
+    }
+
+    private func folderRescanTick() {
+        guard let rescan = folderRescan else { return }
+        let progress = rescan.progress
+        if progress.state == DM_STATE_DONE {
+            finishFolderRescan()
+            return
+        }
+        statusRight.stringValue = "Rescanning “\(rescan.session.name(rescan.node))”…  \(formatCount(progress.files)) files  ·  \(formatBytes(progress.bytes))  ·  \(Int(progress.elapsed)) s"
+    }
+
+    /// Stops a folder rescan and throws its result away.
+    private func dropFolderRescan() {
+        rescanTimer?.invalidate()
+        rescanTimer = nil
+        folderRescan?.cancel()
+        folderRescan = nil
+    }
+
+    private func finishFolderRescan() {
+        guard let rescan = folderRescan, let session, rescan.session === session else {
+            dropFolderRescan()
+            return
+        }
+        rescanTimer?.invalidate()
+        rescanTimer = nil
+        folderRescan = nil
+        defer { window?.toolbar?.validateVisibleItems() }
+
+        let node = rescan.node
+        // Everything inside the folder gets a new id. Remember by name where
+        // the selection and the map were, to find the same places afterwards.
+        let selection = selected != noNode && session.isWithin(selected, node)
+            ? session.names(from: node, to: selected) : nil
+        let zoom = session.isWithin(treemap.root, node) ? session.names(from: node, to: treemap.root) : []
+        let before = session.info(node).size
+
+        // Stopped by the user: the map stays as it was.
+        guard !rescan.progress.cancelled, rescan.apply() else {
+            updateSummaryLine()
+            return
+        }
+        let after = session.info(node).size
+        let change = after == before ? "no change in size"
+            : after > before ? "\(formatBytes(after - before)) larger" : "\(formatBytes(before - after)) smaller"
+        rescanNote = "“\(session.name(node))” rescanned: \(change)"
+
+        hovered = noNode
+        if zoom.isEmpty {
+            treemap.reload()
+        } else {
+            // Back to the folder the map was showing, or as close as still exists.
+            var target = session.descendant(of: node, along: zoom)
+            while target != node && (!session.isDirectory(target) || session.info(target).child_count == 0) {
+                target = session.parent(target)
+            }
+            treemap.zoom(to: target)
+            updateCrumbs()
+        }
+        folders.reload()
+        if let selection {
+            select(session.descendant(of: node, along: selection), from: .other)
+        } else {
+            updateStatus()
+        }
+        refreshStats()
+        updateSummaryLine()
+        updateWarning()
+
+        if let snapshotPath {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self.writeSnapshot(to: snapshotPath) }
         }
     }
 
@@ -509,7 +648,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSMenuI
     @objc func openPrivacySettings(_ sender: Any?) { Privacy.openFullDiskAccessSettings() }
 
     @objc func moveToTrash(_ sender: Any?) {
-        guard let session, let window, isReady, selected != noNode, selected != 0 else { return }
+        guard let session, let window, isReady, folderRescan == nil, selected != noNode, selected != 0 else { return }
         let node = selected
         let info = session.info(node)
         let isDir = info.flags & UInt8(DM_F_DIR) != 0
@@ -529,15 +668,16 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSMenuI
                 NSAlert(error: error).beginSheetModal(for: window)
                 return
             }
-            self.didRemove(node)
+            self.didRemove(node, trashed: true)
         }
     }
 
-    private func didRemove(_ node: UInt32) {
+    /// Takes `node` off the map: it went to the Trash, or it turned out to be gone.
+    private func didRemove(_ node: UInt32, trashed: Bool) {
         guard let session else { return }
         let parent = session.parent(node)
         let zoomedInside = session.isWithin(treemap.root, node)
-        session.remove(node)
+        if trashed { session.remove(node) } else { session.forget(node) }
         hovered = noNode
         if zoomedInside {
             treemap.zoom(to: parent)
@@ -549,6 +689,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSMenuI
         select(parent, from: .other)
         refreshStats()
         updateSummaryLine()
+        updateWarning()
     }
 
     // MARK: Validation
@@ -562,22 +703,35 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSMenuI
             let target = session.isDirectory(selected) ? selected : session.parent(selected)
             return target != noNode && target != treemap.root && session.info(target).child_count > 0
         case #selector(revealInFinder(_:)), #selector(copyPath(_:)): return session != nil && selected != noNode
-        case #selector(moveToTrash(_:)): return isReady && selected != noNode && selected != 0
+        // Not while a folder is being rescanned: its result is swapped into the map as it was.
+        case #selector(moveToTrash(_:)): return isReady && folderRescan == nil && selected != noNode && selected != 0
+        case #selector(rescanFolder(_:)):
+            guard let session, folderRescan == nil, rescanTarget != noNode else { return false }
+            // Other disks and cloud-only folders are not looked inside.
+            return session.info(rescanTarget).flags & UInt8(DM_F_MOUNT | DM_F_DATALESS) == 0
         case #selector(showSummary(_:)): return isReady
         default: return true
         }
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        if menuItem.action == #selector(rescanOrStop(_:)) { menuItem.title = isScanning ? "Stop Scan" : "Rescan" }
+        if menuItem.action == #selector(rescanOrStop(_:)) {
+            menuItem.title = isScanning || folderRescan != nil ? "Stop Scan" : "Rescan"
+        }
+        if menuItem.action == #selector(rescanFolder(_:)) {
+            // Says which folder: with a file selected it is the folder around it.
+            let node = rescanTarget
+            menuItem.title = node == noNode ? "Rescan Folder" : "Rescan “\(session?.name(node) ?? "")”"
+        }
         return isEnabled(menuItem.action)
     }
 
     func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
         if item.itemIdentifier == .rescan {
-            item.image = NSImage(systemSymbolName: isScanning ? "stop.fill" : "arrow.clockwise", accessibilityDescription: nil)
-            item.label = isScanning ? "Stop" : "Rescan"
-            item.toolTip = isScanning ? "Stop scanning" : "Scan the same folder again"
+            let busy = isScanning || folderRescan != nil
+            item.image = NSImage(systemSymbolName: busy ? "stop.fill" : "arrow.clockwise", accessibilityDescription: nil)
+            item.label = busy ? "Stop" : "Rescan"
+            item.toolTip = busy ? "Stop scanning" : "Scan everything again"
         }
         return isEnabled(item.action)
     }
@@ -619,7 +773,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSMenuI
             for entry in menu.items { entry.target = self }
             item.menu = menu
             return item
-        case .rescan: return item("Rescan", "arrow.clockwise", #selector(rescanOrStop(_:)), "Scan the same folder again")
+        case .rescan: return item("Rescan", "arrow.clockwise", #selector(rescanOrStop(_:)), "Scan everything again")
         case .zoomOut: return item("Zoom Out", "arrow.up.left.and.arrow.down.right", #selector(zoomOut(_:)), "Back to the enclosing folder (Esc)")
         case .reveal: return item("Reveal", "magnifyingglass", #selector(revealInFinder(_:)), "Reveal the selection in Finder")
         case .trash: return item("Trash", "trash", #selector(moveToTrash(_:)), "Move the selection to the Trash")

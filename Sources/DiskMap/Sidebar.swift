@@ -150,6 +150,10 @@ final class FolderTreeController: NSObject, NSOutlineViewDataSource, NSOutlineVi
 
     /// Re-reads sizes and order, keeping what is expanded.
     func reload() {
+        if let session {
+            items = items.filter { session.isAlive($0.key) }
+            moreItems = moreItems.filter { session.isAlive($0.key) }
+        }
         outline.reloadData()
     }
 
