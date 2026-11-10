@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/kddige/diskmap/compare/v0.1.0...v0.2.0) (2026-11-10)
+
+
+### Features
+
+* **app:** rescan a single folder ([#4](https://github.com/kddige/diskmap/issues/4)) ([d54408a](https://github.com/kddige/diskmap/commit/d54408a131abe895ff51ac856129b57d5ef8e36f))
+
+
+### Bug Fixes
+
+* **app:** draw the path bar icons undistorted ([#3](https://github.com/kddige/diskmap/issues/3)) ([0769474](https://github.com/kddige/diskmap/commit/0769474a07814bf04a7d4ce20d863f4a53c0dfbd))
+
 ## 0.1.0 (2026-11-10)
 
 
