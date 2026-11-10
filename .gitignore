@@ -1,0 +1,5 @@
+.build/
+.swiftpm/
+DiskMap.app/
+.DS_Store
+DiskMap.zip*
