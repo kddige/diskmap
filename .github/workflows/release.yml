@@ -1,0 +1,58 @@
+name: Release
+
+# On every push to main, release-please reads the commits since the last
+# release and keeps a "release" pull request up to date: next version,
+# version.txt and CHANGELOG.md. Merging that pull request tags the version and
+# publishes a GitHub release with the notes; the build job then attaches the app.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Release pull request
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+
+  build:
+    name: Build and attach the app
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Test
+        run: swift test
+
+      - name: Build the app (Apple silicon and Intel)
+        run: CODESIGN_IDENTITY=- ./build-app.sh --universal
+
+      - name: Package
+        run: |
+          codesign --verify --deep --strict DiskMap.app
+          ditto -c -k --keepParent DiskMap.app DiskMap.zip
+          shasum -a 256 DiskMap.zip > DiskMap.zip.sha256
+          cat DiskMap.zip.sha256
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: gh release upload "$TAG" DiskMap.zip DiskMap.zip.sha256 --clobber

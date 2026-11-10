@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: swift --version
+
+      - name: Test
+        run: swift test
+
+      - name: Build the app (Apple silicon and Intel)
+        run: CODESIGN_IDENTITY=- ./build-app.sh --universal
+
+      - name: Check the bundle
+        run: |
+          codesign --verify --deep --strict DiskMap.app
+          lipo -archs DiskMap.app/Contents/MacOS/DiskMap
+          DiskMap.app/Contents/MacOS/dmscan . --depth 1
+          DiskMap.app/Contents/MacOS/DiskMap Sources --render map.png --size 800x500
+
+      - name: Check the install script
+        run: sh -n install.sh

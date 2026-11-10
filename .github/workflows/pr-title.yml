@@ -1,0 +1,29 @@
+name: PR title
+
+# Pull requests are squash-merged and the title becomes the commit message, so
+# the title is what ends up in the release notes. See AGENTS.md.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  conventional:
+    name: Conventional commit title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          pattern='^(feat|fix|perf|refactor|docs|test|build|ci|chore|revert)(\([a-z0-9-]+\))?!?: [^ ].*[^.]$'
+          if printf '%s' "$TITLE" | grep -Eq "$pattern"; then
+            echo "OK: $TITLE"
+          else
+            echo "::error::The title must look like 'fix(scanner): count sparse files once'."
+            echo "Allowed types: feat fix perf refactor docs test build ci chore revert."
+            echo "Lower-case scope in brackets is optional, '!' marks a breaking change, no trailing full stop."
+            exit 1
+          fi
