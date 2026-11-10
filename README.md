@@ -82,7 +82,7 @@ Options: `--depth N`, `--top N` (entries per folder), `--min-gb X`,
 
 ## Build from source
 
-Needs Xcode 16 or later.
+Needs Xcode 26 or later.
 
     git clone https://github.com/kddige/diskmap.git
     cd diskmap
