@@ -1,0 +1,13 @@
+# The project has no package dependencies. This keeps the pinned GitHub
+# Actions in .github/workflows up to date, in one pull request a week.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]
