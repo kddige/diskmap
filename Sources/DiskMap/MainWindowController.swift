@@ -440,9 +440,25 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSMenuI
         pathControl.pathItems = crumbs.map { node in
             let item = NSPathControlItem()
             item.title = session.name(node)
-            item.image = NSImage(systemSymbolName: node == 0 ? "internaldrive.fill" : "folder.fill", accessibilityDescription: nil)
+            item.image = Self.crumbIcon(node == 0 ? "internaldrive.fill" : "folder.fill")
             return item
         }
+    }
+
+    /// A symbol centred in a square image. The path bar stretches whatever it
+    /// is given to a square, which squeezes symbols that are wider than tall.
+    private static func crumbIcon(_ name: String) -> NSImage? {
+        guard let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .regular)) else { return nil }
+        let side: CGFloat = 16
+        let icon = NSImage(size: NSSize(width: side, height: side), flipped: false) { _ in
+            let scale = min(1, side / max(symbol.size.width, symbol.size.height))
+            let width = symbol.size.width * scale, height = symbol.size.height * scale
+            symbol.draw(in: NSRect(x: (side - width) / 2, y: (side - height) / 2, width: width, height: height))
+            return true
+        }
+        icon.isTemplate = true
+        return icon
     }
 
     @objc private func crumbClicked() {
